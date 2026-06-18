@@ -61,8 +61,17 @@ class FrankaForceEnv:
                 self.data.ctrl[3] = -2.2  
 
     def _extract_contact_forces(self):
-        """Factory Method: Decides what specific interactions to look for"""
+        """Factory Method: Broadened to capture any end-effector assembly collision"""
         total_force = 0.0
+        
+        # Cache all body IDs that belong to the gripper/hand assembly group
+        # This covers whatever part of the hand or wrist slams into the object
+        gripper_body_names = ["link7", "hand", "left_finger", "right_finger"]
+        gripper_body_ids = []
+        for name in gripper_body_names:
+            b_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if b_id != -1: # Ensure the name exists in this specific XML configuration
+                gripper_body_ids.append(b_id)
         
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
@@ -70,16 +79,17 @@ class FrankaForceEnv:
             body2 = self.model.geom_bodyid[contact.geom2]
             
             if self.scenario == "hit_floor":
-                # Is the hand hitting anything (like the floor geom)?
-                if body1 == self.ee_id or body2 == self.ee_id:
+                # Check if ANY part of our hand assembly group hits the floor
+                if body1 in gripper_body_ids or body2 in gripper_body_ids:
                     c_forces = np.zeros(6)
                     mujoco.mj_contactForce(self.model, self.data, i, c_forces)
                     total_force += c_forces[0]
                     
             elif self.scenario == "push_block":
-                # Is the hand explicitly interacting with the red block?
-                is_touching = (body1 == self.ee_id and body2 == self.block_id) or \
-                              (body1 == self.block_id and body2 == self.ee_id)
+                # Check if the collision is between our red block AND any part of the hand assembly group
+                is_touching = (body1 in gripper_body_ids and body2 == self.block_id) or \
+                              (body2 in gripper_body_ids and body1 == self.block_id)
+                              
                 if is_touching:
                     c_forces = np.zeros(6)
                     mujoco.mj_contactForce(self.model, self.data, i, c_forces)
@@ -90,7 +100,7 @@ class FrankaForceEnv:
     def controller_callback(self, model, data):
         """The master loop runner tied directly to MuJoCo's internal heartbeats"""
         # Execute the movement steps
-        self._apply_control_policy()
+        # self._apply_control_policy()
         
         # Log metrics based on downsampled intervals
         if self.step_counter % self.downsample_factor == 0:
