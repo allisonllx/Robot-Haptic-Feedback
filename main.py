@@ -58,8 +58,11 @@ class FrankaForceEnv:
         """Factory Method: Changes how the arm moves depending on the task goal"""
         if self.scenario == "hit_floor":
             # Slam straight downwards
-            self.data.ctrl[1] = -1.0
-            self.data.ctrl[2] = 0.5
+            self.data.ctrl[1] = 0.229
+            self.data.ctrl[3] = -2.20
+            self.data.ctrl[5] = 2.30
+            self.data.ctrl[6] = 0.80
+            self.data.ctrl[7] = 255
             
         elif self.scenario == "push_block":
             # Phase 1A: High Hover (0.0 to 1.5 seconds)
@@ -238,5 +241,5 @@ class FrankaForceEnv:
             pass
 
 if __name__ == "__main__":
-    env = FrankaForceEnv(scenario="push_block") # "hit_floor" or "push_block"
+    env = FrankaForceEnv(scenario="hit_floor") # "hit_floor" or "push_block"
     env.run()
