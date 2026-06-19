@@ -37,8 +37,8 @@ class FrankaForceEnv:
             body.add_freejoint()
             body.add_geom(
                 type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=[0.04, 0.04, 0.05],
-                mass=2.0,
+                size=[0.08, 0.08, 0.05],
+                mass=5.0, # 5.0 kg
                 rgba=[1, 0, 0, 1],
                 condim=3,
                 friction=[1, 0.005, 0.0001],
@@ -56,12 +56,37 @@ class FrankaForceEnv:
             self.data.ctrl[2] = 0.5
             
         elif self.scenario == "push_block":
-            # Phase 1: Get in position behind the box, Phase 2: Drive forward
-            if self.data.time < 2.0:
-                self.data.ctrl[1] = 0.5   
-                self.data.ctrl[3] = -1.5  
+            # Phase 1: Staging (0.0 to 1.5 seconds) -> Hover right above the block
+            # Phase 1: Ready Pose (0.0 to 1.5 seconds) -> Hold perfectly behind the block
+            if self.data.time < 1.5:
+                self.data.ctrl[1] = 0.229  # Shoulder base angle
+                self.data.ctrl[3] = -2.37  # Low elbow flex (Frame 1 pose)
+                self.data.ctrl[5] = 1.87
+                self.data.ctrl[6] = 1.87
+                self.data.ctrl[7] = 255
+                
+            # Phase 2: Coordinated Horizontal Slide (1.5 to 4.5 seconds)
+            elif self.data.time < 4.5:
+                progress = (self.data.time - 1.5) / 3.0  
+                
+                # 1. As the elbow extends forward...
+                self.data.ctrl[3] = -2.37 + progress * (-2.05 - (-2.37))
+                
+                # 2. ...simultaneously lean the shoulder forward/down to kill the upward arc!
+                # This drops the arm base just enough to keep the hand perfectly level.
+                self.data.ctrl[1] = 0.229 + progress * (0.420 - 0.229)
+                
+                self.data.ctrl[5] = 1.87
+                self.data.ctrl[6] = 1.87
+                self.data.ctrl[7] = 255
+                
+            # Phase 3: Maintain Continuous Pressure (After 4.5 seconds)
             else:
-                self.data.ctrl[3] = -2.2  
+                self.data.ctrl[1] = 0.420  # Leaned forward position
+                self.data.ctrl[3] = -2.05  # Fully extended position
+                self.data.ctrl[5] = 1.87
+                self.data.ctrl[6] = 1.87
+                self.data.ctrl[7] = 255
 
     def _get_active_gripper_body_ids(self):
         """Returns the IDs of the active tool center contact surfaces"""
@@ -95,25 +120,28 @@ class FrankaForceEnv:
         # A. Grab raw motor efforts from the 7 arm joints
         tau_measured = self.data.qfrc_actuator[:7]
         
-        # B. Inverse dynamics via mj_rne (safe inside viewer callbacks; mj_inverse is not)
-        tau_id = np.zeros(self.model.nv)
-        mujoco.mj_rne(self.model, self.data, 1, tau_id)
-        tau_bias = tau_id[:7]
+        # B. Extract ONLY gravity, Coriolis, and centrifugal torques
+        tau_passive_bias = self.data.qfrc_bias[:7]
+
+        # C. Inertial torques M(q) @ qacc (use mj_mulM; mj_fullM expects data.qM, not data)
+        tau_inertia = np.zeros(self.model.nv)
+        mujoco.mj_mulM(self.model, self.data, tau_inertia, self.data.qacc)
+        tau_inertia = tau_inertia[:7]
         
-        # C. Isolate the external torque component
-        tau_ext = tau_measured - tau_bias
+        # D. Isolate the external torque component
+        tau_ext = tau_measured - (tau_passive_bias + tau_inertia)
         
-        # D. Extract the 6x7 operational space Jacobian for the Hand body position
+        # E. Extract the 6x7 operational space Jacobian for the Hand body position
         jac_p = np.zeros((3, self.model.nv))
         jac_r = np.zeros((3, self.model.nv))
         mujoco.mj_jac(self.model, self.data, jac_p, jac_r, self.data.xpos[self.hand_body_id], self.hand_body_id)
         J = np.vstack([jac_p, jac_r])[:, :7]
         
-        # E. Map joint torques to Cartesian coordinates using the Pseudo-Inverse of J^T
+        # F. Map joint torques to Cartesian coordinates using the Pseudo-Inverse of J^T
         J_T_pinv = np.linalg.pinv(J.T)
         wrench_estimated = J_T_pinv @ tau_ext
         
-        # F. Return the magnitude of the linear spatial force vector (X, Y, Z)
+        # G. Return the magnitude of the linear spatial force vector (X, Y, Z)
         linear_forces = wrench_estimated[:3]
         return np.linalg.norm(linear_forces)
 
@@ -143,7 +171,7 @@ class FrankaForceEnv:
         print(f"Booting up environment factory running: [{self.scenario.upper()}]")
 
         # Optional automated motion; comment out to keep manual drag-only control.
-        # mujoco.set_mjcb_control(self._apply_control_policy_callback)
+        mujoco.set_mjcb_control(self._apply_control_policy_callback)
 
         mujoco.set_mjcb_passive(self._passive_callback)
         try:
