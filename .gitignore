@@ -1,3 +1,4 @@
 codedb.snapshot
 MUJOCO_LOG.txt
 __pycache__/
+results/
