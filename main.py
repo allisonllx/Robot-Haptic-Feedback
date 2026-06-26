@@ -13,14 +13,24 @@ class FrankaForceEnv:
         self.results_dir = RESULTS_DIR / scenario
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.telemetry_path = self.results_dir / 'force_verification_log.csv'
-        self.plot_path = self.results_dir / 'force_comparison.png'
-        self.plot_contact_path = self.results_dir / 'force_comparison_contact_only.png'
+        self.telemetry_filtered_path = self.results_dir / 'force_verification_log_filtered.csv'
+        self.plot_raw_path = self.results_dir / 'force_comparison_raw.png'
+        self.plot_filtered_path = self.results_dir / 'force_comparison_filtered.png'
+        self.plot_contact_raw_path = self.results_dir / 'force_comparison_contact_only_raw.png'
+        self.plot_contact_filtered_path = self.results_dir / 'force_comparison_contact_only_filtered.png'
+
+        # Flag samples where ground truth diverges sharply from the Jacobian estimate.
+        self.anomaly_ratio_high = 5.0
+        self.anomaly_ratio_low = 0.2
+        self.anomaly_abs_max = 1000.0
+        self.min_est_for_ratio = 5.0
         
         # Storage lists for timeline telemetry
         self.time_history = []
         self.true_force_history = []
         self.estimated_force_history = []
         self.in_contact_history = []
+        self.anomaly_history = []
 
         self.step_counter = 0
         self.downsample_factor = 10
@@ -29,7 +39,7 @@ class FrankaForceEnv:
         self.log_file = open(self.telemetry_path, mode="w", newline="")
         self.log_writer = csv.writer(self.log_file)
         self.log_writer.writerow([
-            "Time (s)", "Ground Truth (N)", "Jacobian Estimate (N)", "In Contact"
+            "Time (s)", "Ground Truth (N)", "Jacobian Estimate (N)", "In Contact", "Is Anomaly"
         ])
         
         # 1. Build the MuJoCo model for the chosen scenario
@@ -165,6 +175,20 @@ class FrankaForceEnv:
         wrench_estimated = np.linalg.pinv(J.T) @ tau_contact
         return float(np.linalg.norm(wrench_estimated[:3]))
 
+    def _is_anomaly(self, f_true, f_est, in_contact):
+        """Heuristic outlier flag for multi-contact spikes and vector-cancellation dips."""
+        if f_true > self.anomaly_abs_max:
+            return True
+        if not in_contact:
+            return f_true > 1.0
+        if f_est < self.min_est_for_ratio:
+            return f_true > 50.0
+
+        ratio = f_true / max(f_est, 1e-9)
+        if ratio > self.anomaly_ratio_high or ratio < self.anomaly_ratio_low:
+            return True
+        return False
+
     def _record_telemetry(self):
         """Sample ground-truth and estimated forces."""
         if self.step_counter % self.downsample_factor == 0:
@@ -172,13 +196,15 @@ class FrankaForceEnv:
             in_contact = self._has_target_contact(gripper_ids)
             f_true = self._calculate_ground_truth_force(gripper_ids)
             f_est = self._estimate_virtual_force() if in_contact else 0.0
+            is_anomaly = self._is_anomaly(f_true, f_est, in_contact)
 
             self.time_history.append(self.data.time)
             self.true_force_history.append(f_true)
             self.estimated_force_history.append(f_est)
             self.in_contact_history.append(in_contact)
+            self.anomaly_history.append(is_anomaly)
 
-            self.log_writer.writerow([self.data.time, f_true, f_est, int(in_contact)])
+            self.log_writer.writerow([self.data.time, f_true, f_est, int(in_contact), int(is_anomaly)])
 
         self.step_counter += 1
 
@@ -225,22 +251,58 @@ class FrankaForceEnv:
         f_true = np.array(self.true_force_history)
         f_est = np.array(self.estimated_force_history)
         in_contact = np.array(self.in_contact_history, dtype=bool)
+        is_anomaly = np.array(self.anomaly_history, dtype=bool)
+        is_clean = ~is_anomaly
+
+        self._write_filtered_csv(t, f_true, f_est, in_contact, is_clean)
 
         self._save_plot(
             plt, t, f_true, f_est,
-            title='Verification Profile: Measured vs. Estimated Contact Forces',
-            path=self.plot_path,
+            title='Raw: Measured vs. Estimated Contact Forces',
+            path=self.plot_raw_path,
         )
+
+        if np.any(is_clean):
+            self._save_plot(
+                plt, t[is_clean], f_true[is_clean], f_est[is_clean],
+                title='Filtered: Measured vs. Estimated Contact Forces',
+                path=self.plot_filtered_path,
+            )
+        else:
+            print("No clean samples left after filtering; skipped filtered full plot.")
 
         if np.any(in_contact):
             self._save_plot(
                 plt, t[in_contact], f_true[in_contact], f_est[in_contact],
-                title='Contact-Only: Measured vs. Estimated Contact Forces',
-                path=self.plot_contact_path,
+                title='Raw (Contact-Only): Measured vs. Estimated Contact Forces',
+                path=self.plot_contact_raw_path,
             )
-            print(f"Saved contact-only plot to {self.plot_contact_path.resolve()}")
+
+            contact_clean = in_contact & is_clean
+            if np.any(contact_clean):
+                self._save_plot(
+                    plt, t[contact_clean], f_true[contact_clean], f_est[contact_clean],
+                    title='Filtered (Contact-Only): Measured vs. Estimated Contact Forces',
+                    path=self.plot_contact_filtered_path,
+                )
+            else:
+                print("No clean contact samples; skipped filtered contact-only plot.")
         else:
-            print("No target contacts recorded; skipped contact-only plot.")
+            print("No target contacts recorded; skipped contact-only plots.")
+
+        n_anomaly = int(np.sum(is_anomaly))
+        print(f"Flagged {n_anomaly}/{len(t)} samples as anomalies "
+              f"({100 * n_anomaly / len(t):.1f}%)")
+
+    def _write_filtered_csv(self, times, true_forces, est_forces, in_contact, is_clean):
+        with open(self.telemetry_filtered_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Time (s)", "Ground Truth (N)", "Jacobian Estimate (N)", "In Contact"])
+            for i in np.where(is_clean)[0]:
+                writer.writerow([
+                    times[i], true_forces[i], est_forces[i], int(in_contact[i])
+                ])
+        print(f"Saved filtered CSV to {self.telemetry_filtered_path.resolve()}")
 
     def _save_plot(self, plt, times, true_forces, est_forces, title, path):
         fig, ax = plt.subplots(figsize=(10, 4))
