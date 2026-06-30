@@ -14,6 +14,10 @@ except ImportError:
 class PegInHoleScenario(Scenario):
     name = "peg_in_hole"
     supports_interactive = True
+    force_visual_min = 10.0
+    force_visual_threshold = force_visual_min
+    force_visual_max = 1000.0
+    force_arrow_offset = np.array([0.0, -0.12, 0.14])
 
     def initialize_state(self, env):
         env.target_pos = np.zeros(3)
@@ -97,8 +101,10 @@ class PegInHoleScenario(Scenario):
         self._apply_peg_ik_control(env)
 
     def sample_forces(self, env):
-        in_contact = self._has_peg_contact(env)
-        f_true = self._calculate_peg_ground_truth_force(env)
+        in_contact, f_true, contact_pos, contact_frame, contact_force = self._peg_contact_summary(env)
+        env.latest_contact_pos = contact_pos
+        env.latest_contact_frame = contact_frame
+        env.latest_contact_force = contact_force
         f_est = env._estimate_virtual_force() if in_contact else 0.0
         return in_contact, f_true, f_est
 
@@ -119,8 +125,9 @@ class PegInHoleScenario(Scenario):
         print("Peg orientation is locked pointing down; use 6/7 to spin it.")
         if env.force_feedback:
             print("Force feedback overlay: ON")
-            print("  Green sphere above hand = waiting for contact")
-            print("  Vertical green→red arrow + tip sphere = force while inserted")
+            print(f"  Visual mode: {env.force_visual}")
+            print("  Green sphere above hand = waiting for contact.")
+            print("  Red/orange arrow and/or contact ring scale with force.")
             print("  (Run with --force-feedback; HUD also shows force in newtons)")
         else:
             print("Force feedback overlay: OFF")
@@ -394,21 +401,33 @@ class PegInHoleScenario(Scenario):
             env.data.ctrl[i] = q_des[i]
         env.data.ctrl[7] = 255.0 if gripper_closed else 0.0
 
-    def _has_peg_contact(self, env):
-        for i in range(env.data.ncon):
-            contact = env.data.contact[i]
-            if contact.geom1 == env.peg_geom_id or contact.geom2 == env.peg_geom_id:
-                return True
-        return False
-
-    def _calculate_peg_ground_truth_force(self, env):
+    def _peg_contact_summary(self, env):
         force_world = np.zeros(3)
+        strongest_force = 0.0
+        strongest_pos = None
+        strongest_frame = None
+
         for i in range(env.data.ncon):
             contact = env.data.contact[i]
             if contact.geom1 != env.peg_geom_id and contact.geom2 != env.peg_geom_id:
                 continue
-            force_world += env._contact_force_in_world(i)
-        return float(np.linalg.norm(force_world))
+
+            contact_force = env._contact_force_in_world(i)
+            contact_force_mag = float(np.linalg.norm(contact_force))
+            force_world += contact_force
+
+            if contact_force_mag > strongest_force:
+                strongest_force = contact_force_mag
+                strongest_pos = contact.pos.copy()
+                strongest_frame = contact.frame.reshape(3, 3).copy()
+
+        return (
+            strongest_pos is not None,
+            float(np.linalg.norm(force_world)),
+            strongest_pos,
+            strongest_frame,
+            strongest_force,
+        )
 
     def _sync_target_marker(self, env):
         with env._teleop_lock:
@@ -536,6 +555,7 @@ class PegInHoleScenario(Scenario):
             force_line = (
                 f"force {f_display:.1f} N"
                 + (" (contact)" if env.latest_in_contact else " (no contact yet)")
+                + f" | visual {env.force_visual}"
             )
         viewer.set_texts([
             (
@@ -565,16 +585,29 @@ class PegInHoleScenario(Scenario):
         f_display = env._force_feedback_magnitude()
         hand_pos = env.data.xpos[env.hand_body_id].astype(np.float64)
         identity = np.eye(3, dtype=np.float64).reshape(9, 1)
-        zero3 = np.zeros((3, 1), dtype=np.float64)
 
         viewer.user_scn.ngeom = 0
         idx = 0
 
-        base_pos = (hand_pos + np.array([0.0, 0.0, 0.05])).reshape(3, 1)
-        if f_display <= 0.05:
+        idx = self._draw_idle_marker(env, viewer, idx, hand_pos, identity, f_display)
+
+        if f_display > self.force_visual_threshold:
+            if env.force_visual in ("arrow", "both"):
+                idx = self._draw_force_arrow(viewer, idx, hand_pos, identity, f_display)
+            if env.force_visual in ("ring", "both"):
+                idx = self._draw_contact_ring(env, viewer, idx, identity)
+
+        viewer.user_scn.ngeom = idx
+
+    def _draw_idle_marker(self, env, viewer, idx, hand_pos, identity, f_display):
+        if not self._has_user_geom_slot(viewer, idx):
+            return idx
+
+        base_pos = self._force_gauge_origin(hand_pos).reshape(3, 1)
+        if f_display <= self.force_visual_threshold:
             base_rgba = np.array([0.25, 0.85, 0.35, 0.9], dtype=np.float32).reshape(4, 1)
         else:
-            base_rgba = np.array([0.15, 0.75, 0.25, 0.9], dtype=np.float32).reshape(4, 1)
+            base_rgba = np.array([1.0, 0.20, 0.05, 0.9], dtype=np.float32).reshape(4, 1)
 
         self._set_user_geom(
             viewer.user_scn.geoms[idx],
@@ -584,30 +617,89 @@ class PegInHoleScenario(Scenario):
             identity,
             base_rgba,
         )
-        idx += 1
+        return idx + 1
 
-        if f_display > 0.05:
-            max_threshold = 35.0
-            intensity = min(f_display / max_threshold, 1.0)
-            arrow_len = 0.08 + intensity * 0.28
-            shaft_width = 0.020
-            p1 = hand_pos + np.array([0.0, 0.0, 0.07])
-            p2 = hand_pos + np.array([0.0, 0.0, 0.07 + arrow_len])
-            color = np.array([intensity, 1.0 - intensity, 0.0, 0.95], dtype=np.float32).reshape(4, 1)
+    def _draw_force_arrow(self, viewer, idx, hand_pos, identity, force_magnitude):
+        if not self._has_user_geom_slot(viewer, idx):
+            return idx
 
-            arrow_geom = viewer.user_scn.geoms[idx]
-            self._set_user_geom(arrow_geom, mujoco.mjtGeom.mjGEOM_ARROW, zero3, zero3, identity, color)
-            mujoco.mjv_connector(arrow_geom, mujoco.mjtGeom.mjGEOM_ARROW, shaft_width, p1, p2)
+        intensity = self._force_visual_intensity(force_magnitude)
+        arrow_len = 0.06 + intensity * 0.42
+        shaft_width = 0.012 + intensity * 0.018
+        p1 = self._force_gauge_origin(hand_pos)
+        p2 = p1 + np.array([0.0, 0.0, arrow_len])
+        color = self._force_color(intensity)
+        zero3 = np.zeros((3, 1), dtype=np.float64)
+
+        arrow_geom = viewer.user_scn.geoms[idx]
+        self._set_user_geom(arrow_geom, mujoco.mjtGeom.mjGEOM_ARROW, zero3, zero3, identity, color)
+        mujoco.mjv_connector(arrow_geom, mujoco.mjtGeom.mjGEOM_ARROW, shaft_width, p1, p2)
+        return idx + 1
+
+    def _draw_contact_ring(self, env, viewer, idx, identity):
+        if env.latest_contact_pos is None or env.latest_contact_frame is None:
+            return idx
+
+        segments = 24
+        if not self._has_user_geom_slot(viewer, idx + segments - 1):
+            return idx
+
+        force_magnitude = max(env.latest_contact_force, self._force_feedback_magnitude(env))
+        intensity = self._force_visual_intensity(force_magnitude)
+        radius = 0.025 + intensity * 0.095
+        ring_width = 0.0035 + intensity * 0.007
+        color = self._force_color(intensity)
+        frame = env.latest_contact_frame
+        normal = self._unit_vector(frame[0], np.array([0.0, 0.0, 1.0]))
+        tangent_a = self._unit_vector(frame[1], np.array([1.0, 0.0, 0.0]))
+        tangent_b = np.cross(normal, tangent_a)
+        if np.linalg.norm(tangent_b) < 1e-9:
+            tangent_b = self._unit_vector(frame[2], np.array([0.0, 1.0, 0.0]))
+        else:
+            tangent_b = self._unit_vector(tangent_b, np.array([0.0, 1.0, 0.0]))
+        tangent_a = self._unit_vector(np.cross(tangent_b, normal), tangent_a)
+        center = env.latest_contact_pos + normal * 0.002
+        zero3 = np.zeros((3, 1), dtype=np.float64)
+
+        for segment in range(segments):
+            theta1 = 2.0 * np.pi * segment / segments
+            theta2 = 2.0 * np.pi * (segment + 1) / segments
+            p1 = center + radius * (np.cos(theta1) * tangent_a + np.sin(theta1) * tangent_b)
+            p2 = center + radius * (np.cos(theta2) * tangent_a + np.sin(theta2) * tangent_b)
+            ring_geom = viewer.user_scn.geoms[idx]
+            self._set_user_geom(ring_geom, mujoco.mjtGeom.mjGEOM_CAPSULE, zero3, zero3, identity, color)
+            mujoco.mjv_connector(ring_geom, mujoco.mjtGeom.mjGEOM_CAPSULE, ring_width, p1, p2)
             idx += 1
 
-            self._set_user_geom(
-                viewer.user_scn.geoms[idx],
-                mujoco.mjtGeom.mjGEOM_SPHERE,
-                np.array([0.026, 0.0, 0.0], dtype=np.float64).reshape(3, 1),
-                p2.reshape(3, 1),
-                identity,
-                color,
-            )
-            idx += 1
+        return idx
 
-        viewer.user_scn.ngeom = idx
+    def _force_visual_intensity(self, force_magnitude):
+        if force_magnitude <= self.force_visual_min:
+            return 0.0
+        log_min = np.log(self.force_visual_min)
+        log_max = np.log(self.force_visual_max)
+        log_force = np.log(min(force_magnitude, self.force_visual_max))
+        return float(np.clip((log_force - log_min) / (log_max - log_min), 0.0, 1.0))
+
+    def _force_gauge_origin(self, hand_pos):
+        return hand_pos + self.force_arrow_offset
+
+    def _force_color(self, intensity):
+        green = 0.35 * (1.0 - intensity)
+        return np.array([1.0, green, 0.02, 0.95], dtype=np.float32).reshape(4, 1)
+
+    def _unit_vector(self, value, fallback):
+        value = np.asarray(value, dtype=np.float64)
+        norm = np.linalg.norm(value)
+        if norm < 1e-9:
+            return fallback.astype(np.float64)
+        return value / norm
+
+    def _has_user_geom_slot(self, viewer, idx):
+        maxgeom = getattr(viewer.user_scn, "maxgeom", None)
+        if maxgeom is None:
+            maxgeom = len(viewer.user_scn.geoms)
+        return idx < maxgeom
+
+    def _force_feedback_magnitude(self, env):
+        return max(env.latest_f_est, env.latest_f_true)

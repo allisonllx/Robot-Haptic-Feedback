@@ -1,6 +1,6 @@
 import argparse
 
-from franka_force import SCENARIOS
+from franka_force import FORCE_VISUAL_MODES, SCENARIOS
 
 
 def parse_args():
@@ -19,7 +19,13 @@ def parse_args():
     parser.add_argument(
         "--force-feedback",
         action="store_true",
-        help="Enable live force arrow overlay (peg_in_hole + --interactive only)",
+        help="Enable live force visual overlay (peg_in_hole + --interactive only)",
+    )
+    parser.add_argument(
+        "--force-visual",
+        choices=FORCE_VISUAL_MODES,
+        default="arrow",
+        help="Force feedback visual to show when --force-feedback is enabled",
     )
     parser.add_argument(
         "--record-video",
@@ -37,6 +43,7 @@ if __name__ == "__main__":
         scenario=args.scenario,
         interactive=args.interactive,
         force_feedback=args.force_feedback,
+        force_visual=args.force_visual,
         record_video=args.record_video,
     )
     env.run()

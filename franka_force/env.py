@@ -4,21 +4,31 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from .config import MODEL_PATH, RESULTS_DIR
+from .config import FORCE_VISUAL_MODES, MODEL_PATH, RESULTS_DIR
 from .plotting import plot_force_comparison
 from .recording import VideoRecorder
 from .scenarios import SCENARIOS, get_scenario
 
 
 class FrankaForceEnv:
-    def __init__(self, scenario="hit_floor", interactive=False, force_feedback=False, record_video=False):
+    def __init__(
+        self,
+        scenario="hit_floor",
+        interactive=False,
+        force_feedback=False,
+        force_visual="arrow",
+        record_video=False,
+    ):
         if scenario not in SCENARIOS:
             raise ValueError(f"Unknown scenario: {scenario}. Choose from {SCENARIOS}")
+        if force_visual not in FORCE_VISUAL_MODES:
+            raise ValueError(f"Unknown force visual: {force_visual}. Choose from {FORCE_VISUAL_MODES}")
 
         self.scenario = scenario
         self.scenario_impl = get_scenario(scenario)
         self.interactive = interactive
         self.force_feedback = force_feedback
+        self.force_visual = force_visual
         self.record_video = record_video
 
         if force_feedback and not interactive:
@@ -54,6 +64,9 @@ class FrankaForceEnv:
         self.latest_f_est = 0.0
         self.latest_f_true = 0.0
         self.latest_in_contact = False
+        self.latest_contact_pos = None
+        self.latest_contact_frame = None
+        self.latest_contact_force = 0.0
 
         self.scenario_impl.initialize_state(self)
 

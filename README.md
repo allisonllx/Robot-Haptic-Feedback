@@ -10,7 +10,7 @@ MuJoCo simulations for checking contact-force estimates on a Franka Emika Panda 
 
 ## Setup
 
-Create and activate a Python environment, then install the requirements:
+Activate your `odyssey` environment, or create a fresh Python environment and install the requirements:
 
 ```bash
 python3 -m venv .venv
@@ -54,6 +54,16 @@ Enable live force feedback during interactive peg insertion:
 mjpython main.py --scenario peg_in_hole --interactive --force-feedback
 ```
 
+Choose the force-feedback visual:
+
+```bash
+mjpython main.py --scenario peg_in_hole --interactive --force-feedback --force-visual arrow
+mjpython main.py --scenario peg_in_hole --interactive --force-feedback --force-visual ring
+mjpython main.py --scenario peg_in_hole --interactive --force-feedback --force-visual both
+```
+
+`arrow` draws a red/orange force arrow offset beside the hand, `ring` draws a red/orange ring at the strongest peg contact point, and `both` draws both overlays. The size of each overlay uses a log scale from roughly `10 N` to `1000 N`, so mid-range forces remain visually distinguishable without huge spikes dominating the view.
+
 Record a video of a run:
 
 ```bash
@@ -93,6 +103,10 @@ franka_force/scenarios/         Scenario-specific model, control, and contact lo
 ```
 
 `FrankaForceEnv` delegates scenario-specific behavior through the scenario registry in `franka_force/scenarios/__init__.py`, so adding a new scenario should usually mean adding one scenario module and registering it there.
+
+## Control Experiments
+
+The current interactive controller reacts after contact is detected through MuJoCo contact forces. It does not slow down before first contact because there is no proximity signal in the current setup. A future `--contact-cushion` experiment could reduce teleop target speed, back off, or lower controller aggressiveness after force crosses a threshold, but true pre-contact impedance behavior would need either a proximity sensor, simulation-only distance checks, or a different torque-level control path.
 
 ## Development Checks
 
