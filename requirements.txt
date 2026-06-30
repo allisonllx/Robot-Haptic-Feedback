@@ -2,3 +2,5 @@ mujoco
 numpy
 matplotlib
 pynput
+imageio
+imageio-ffmpeg

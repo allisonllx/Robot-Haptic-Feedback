@@ -14,16 +14,81 @@ except ImportError:
 MODEL_PATH = Path('mujoco_menagerie/franka_emika_panda/scene.xml')
 RESULTS_DIR = Path('results')
 SCENARIOS = ("hit_floor", "push_block", "peg_in_hole")
+VIDEO_FPS = 30
+VIDEO_WIDTH = 960
+VIDEO_HEIGHT = 540
+VIDEO_CAPTURE_EVERY = 2
+
+
+class VideoRecorder:
+    """Stream offscreen frames to mp4 (uses the same camera as the passive viewer)."""
+
+    def __init__(self, model, path, fps=VIDEO_FPS, width=VIDEO_WIDTH, height=VIDEO_HEIGHT):
+        self.path = Path(path)
+        self.fps = fps
+        self.capture_every = VIDEO_CAPTURE_EVERY
+        model.vis.global_.offwidth = max(model.vis.global_.offwidth, width)
+        model.vis.global_.offheight = max(model.vis.global_.offheight, height)
+        self.renderer = mujoco.Renderer(model, height, width)
+        self._writer = None
+        self._frame_counter = 0
+        self._saved_frames = 0
+
+    def start(self):
+        try:
+            import imageio
+        except ImportError as exc:
+            raise RuntimeError(
+                "Video recording requires imageio. Install with: pip install imageio imageio-ffmpeg"
+            ) from exc
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._writer = imageio.get_writer(
+            str(self.path),
+            fps=self.fps,
+            macro_block_size=1,
+        )
+
+    def capture(self, data, camera):
+        if self._writer is None:
+            return
+
+        self._frame_counter += 1
+        if (self._frame_counter - 1) % self.capture_every != 0:
+            return
+
+        self.renderer.update_scene(data, camera=camera)
+        frame = self.renderer.render()
+        self._writer.append_data(frame)
+        self._saved_frames += 1
+
+    def close(self):
+        if self._writer is None:
+            return
+
+        self._writer.close()
+        self._writer = None
+        if self._saved_frames == 0:
+            print("No video frames captured; skipping video save.")
+            if self.path.exists():
+                self.path.unlink()
+            return
+
+        print(
+            f"Saved run video ({self._saved_frames} frames @ {self.fps} fps) "
+            f"to {self.path.resolve()}"
+        )
 
 
 class FrankaForceEnv:
-    def __init__(self, scenario="hit_floor", interactive=False, force_feedback=False):
+    def __init__(self, scenario="hit_floor", interactive=False, force_feedback=False, record_video=False):
         if scenario not in SCENARIOS:
             raise ValueError(f"Unknown scenario: {scenario}. Choose from {SCENARIOS}")
 
         self.scenario = scenario
         self.interactive = interactive
         self.force_feedback = force_feedback
+        self.record_video = record_video
 
         if force_feedback and not interactive:
             raise ValueError("force_feedback requires interactive=True")
@@ -38,6 +103,7 @@ class FrankaForceEnv:
         self.plot_filtered_path = self.results_dir / 'force_comparison_filtered.png'
         self.plot_contact_raw_path = self.results_dir / 'force_comparison_contact_only_raw.png'
         self.plot_contact_filtered_path = self.results_dir / 'force_comparison_contact_only_filtered.png'
+        self.video_path = self.results_dir / 'run_recording.mp4'
 
         # Flag samples where ground truth diverges sharply from the Jacobian estimate.
         self.anomaly_ratio_high = 5.0
@@ -55,7 +121,8 @@ class FrankaForceEnv:
         self.step_counter = 0
         self.downsample_factor = 10
         self.latest_f_est = 0.0
-        self._user_scn_base_ngeom = None
+        self.latest_f_true = 0.0
+        self.latest_in_contact = False
 
         if scenario == "peg_in_hole":
             self.target_pos = np.zeros(3)
@@ -550,8 +617,13 @@ class FrankaForceEnv:
         self.step_counter += 1
 
     def _update_live_force(self):
-        _, _, f_est = self._sample_forces()
+        in_contact, f_true, f_est = self._sample_forces()
+        self.latest_in_contact = in_contact
+        self.latest_f_true = f_true
         self.latest_f_est = f_est
+
+    def _force_feedback_magnitude(self):
+        return max(self.latest_f_est, self.latest_f_true)
 
     def _sync_target_marker(self):
         with self._teleop_lock:
@@ -704,13 +776,21 @@ class FrankaForceEnv:
             gripper = "closed" if self.gripper_closed else "open"
             moving = np.any(self._move_cmd != 0) or self._roll_cmd != 0
             roll_deg = np.degrees(self.target_roll)
+        force_line = ""
+        if self.force_feedback:
+            f_display = self._force_feedback_magnitude()
+            force_line = (
+                f"force {f_display:.1f} N"
+                + (" (contact)" if self.latest_in_contact else " (no contact yet)")
+            )
         viewer.set_texts([
             (
                 mujoco.mjtFontScale.mjFONTSCALE_150,
                 mujoco.mjtGridPos.mjGRID_TOPLEFT,
                 "Arrows=N/S/E/W | 9/8=Z | 6/7=roll | ,/.=gripper | peg locked down",
                 f"target ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})  roll {roll_deg:.0f}°  {gripper}"
-                + ("  MOVING" if moving else ""),
+                + ("  MOVING" if moving else "")
+                + (f"  |  {force_line}" if force_line else ""),
             ),
             (
                 mujoco.mjtFontScale.mjFONTSCALE_150,
@@ -720,33 +800,63 @@ class FrankaForceEnv:
             ),
         ])
 
+    def _set_user_geom(self, geom, gtype, size, pos, mat, rgba):
+        mujoco.mjv_initGeom(geom, gtype, size, pos, mat, rgba)
+        geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+
     def _draw_force_feedback(self, viewer):
-        if not self.force_feedback or self.latest_f_est <= 0.5:
+        if not self.force_feedback or viewer.user_scn is None:
             return
 
-        if viewer.user_scn is None:
-            return
+        f_display = self._force_feedback_magnitude()
+        hand_pos = self.data.xpos[self.hand_body_id].astype(np.float64)
+        identity = np.eye(3, dtype=np.float64).reshape(9, 1)
+        zero3 = np.zeros((3, 1), dtype=np.float64)
 
-        if self._user_scn_base_ngeom is None:
-            self._user_scn_base_ngeom = viewer.user_scn.ngeom
+        viewer.user_scn.ngeom = 0
+        idx = 0
 
-        viewer.user_scn.ngeom = self._user_scn_base_ngeom
+        base_pos = (hand_pos + np.array([0.0, 0.0, 0.05])).reshape(3, 1)
+        if f_display <= 0.05:
+            base_rgba = np.array([0.25, 0.85, 0.35, 0.9], dtype=np.float32).reshape(4, 1)
+        else:
+            base_rgba = np.array([0.15, 0.75, 0.25, 0.9], dtype=np.float32).reshape(4, 1)
 
-        max_threshold = 35.0
-        intensity = min(self.latest_f_est / max_threshold, 1.0)
-        arrow_color = [intensity, 1.0 - intensity, 0.0, 1.0]
-        arrow_length = 0.03 + (intensity * 0.12)
-
-        geom_idx = viewer.user_scn.ngeom
-        viewer.user_scn.ngeom += 1
-        mujoco.mjv_initGeom(
-            viewer.user_scn.geoms[geom_idx],
-            mujoco.mjtGeom.mjGEOM_ARROW,
-            np.array([0.006, 0.006, arrow_length], dtype=np.float64).reshape(3, 1),
-            self.data.xpos[self.hand_body_id].astype(np.float64).reshape(3, 1),
-            self.data.xmat[self.hand_body_id].astype(np.float64).reshape(9, 1),
-            np.array(arrow_color, dtype=np.float32).reshape(4, 1),
+        self._set_user_geom(
+            viewer.user_scn.geoms[idx],
+            mujoco.mjtGeom.mjGEOM_SPHERE,
+            np.array([0.020, 0.0, 0.0], dtype=np.float64).reshape(3, 1),
+            base_pos,
+            identity,
+            base_rgba,
         )
+        idx += 1
+
+        if f_display > 0.05:
+            max_threshold = 35.0
+            intensity = min(f_display / max_threshold, 1.0)
+            arrow_len = 0.08 + intensity * 0.28
+            shaft_width = 0.020
+            p1 = hand_pos + np.array([0.0, 0.0, 0.07])
+            p2 = hand_pos + np.array([0.0, 0.0, 0.07 + arrow_len])
+            color = np.array([intensity, 1.0 - intensity, 0.0, 0.95], dtype=np.float32).reshape(4, 1)
+
+            arrow_geom = viewer.user_scn.geoms[idx]
+            self._set_user_geom(arrow_geom, mujoco.mjtGeom.mjGEOM_ARROW, zero3, zero3, identity, color)
+            mujoco.mjv_connector(arrow_geom, mujoco.mjtGeom.mjGEOM_ARROW, shaft_width, p1, p2)
+            idx += 1
+
+            self._set_user_geom(
+                viewer.user_scn.geoms[idx],
+                mujoco.mjtGeom.mjGEOM_SPHERE,
+                np.array([0.026, 0.0, 0.0], dtype=np.float64).reshape(3, 1),
+                p2.reshape(3, 1),
+                identity,
+                color,
+            )
+            idx += 1
+
+        viewer.user_scn.ngeom = idx
 
     def _apply_control_policy_callback(self, model, data):
         self._apply_control_policy()
@@ -770,10 +880,75 @@ class FrankaForceEnv:
         print("Hold arrow keys for smooth motion if pynput is installed.")
         print("Peg orientation is locked pointing down; use 6/7 to spin it.")
         if self.force_feedback:
-            print("Force feedback overlay: ON (green=safe, red=high force)")
+            print("Force feedback overlay: ON")
+            print("  Green sphere above hand = waiting for contact")
+            print("  Vertical green→red arrow + tip sphere = force while inserted")
+            print("  (Run with --force-feedback; HUD also shows force in newtons)")
         else:
             print("Force feedback overlay: OFF")
         print()
+
+    def _run_passive_viewer(self, interactive=False):
+        if interactive:
+            self._print_peg_controls()
+            self._start_pynput_teleop()
+
+        recorder = None
+        if self.record_video:
+            recorder = VideoRecorder(self.model, self.video_path)
+            recorder.start()
+            print(f"Recording video → {self.video_path.resolve()}")
+
+        mujoco.set_mjcb_control(self._apply_control_policy_callback)
+        substeps = 3 if interactive else 1
+
+        try:
+            with mujoco.viewer.launch_passive(
+                self.model,
+                self.data,
+                key_callback=self._viewer_key_callback if interactive else None,
+                show_left_ui=False,
+                show_right_ui=False,
+            ) as viewer:
+                while viewer.is_running():
+                    if interactive:
+                        self._apply_teleop_motion(self.model.opt.timestep)
+                        self._sync_target_marker()
+
+                    for _ in range(substeps):
+                        mujoco.mj_step(self.model, self.data)
+
+                    if interactive:
+                        self._update_live_force()
+                    self._record_telemetry()
+
+                    if interactive:
+                        self._draw_force_feedback(viewer)
+                        self._update_peg_hud(viewer)
+
+                    if recorder is not None:
+                        recorder.capture(self.data, viewer.cam)
+
+                    viewer.sync()
+        except RuntimeError as exc:
+            if "mjpython" in str(exc).lower():
+                hint = (
+                    "Passive viewer (required for --record-video) needs `mjpython` on macOS.\n"
+                    "  Run: mjpython main.py --scenario peg_in_hole --interactive --record-video"
+                )
+                if not interactive:
+                    hint = (
+                        "Video recording uses the passive viewer and needs `mjpython` on macOS.\n"
+                        "  Run: mjpython main.py --scenario push_block --record-video"
+                    )
+                raise RuntimeError(hint) from exc
+            raise
+        finally:
+            if recorder is not None:
+                recorder.close()
+            if interactive:
+                self._stop_pynput_teleop()
+            mujoco.set_mjcb_control(None)
 
     def _run_standard_viewer(self):
         mujoco.set_mjcb_control(self._apply_control_policy_callback)
@@ -792,45 +967,15 @@ class FrankaForceEnv:
             mujoco.set_mjcb_control(None)
 
     def _run_interactive_peg(self):
-        self._print_peg_controls()
-        mujoco.set_mjcb_control(self._apply_control_policy_callback)
-        self._start_pynput_teleop()
-
-        try:
-            with mujoco.viewer.launch_passive(
-                self.model,
-                self.data,
-                key_callback=self._viewer_key_callback,
-                show_left_ui=False,
-                show_right_ui=False,
-            ) as viewer:
-                while viewer.is_running():
-                    self._apply_teleop_motion(self.model.opt.timestep)
-                    self._sync_target_marker()
-                    for _ in range(3):
-                        mujoco.mj_step(self.model, self.data)
-                    self._update_live_force()
-                    self._record_telemetry()
-                    self._draw_force_feedback(viewer)
-                    self._update_peg_hud(viewer)
-                    viewer.sync()
-        except RuntimeError as exc:
-            if "mjpython" in str(exc).lower():
-                raise RuntimeError(
-                    "Interactive peg-in-hole requires `mjpython` on macOS.\n"
-                    "  Run: mjpython main.py --scenario peg_in_hole --interactive\n"
-                    "  Or disable interactive mode for the standard viewer."
-                ) from exc
-            raise
-        finally:
-            self._stop_pynput_teleop()
-            mujoco.set_mjcb_control(None)
+        self._run_passive_viewer(interactive=True)
 
     def run(self):
         print(f"Booting up environment factory running: [{self.scenario.upper()}]")
 
         if self.scenario == "peg_in_hole" and self.interactive:
             self._run_interactive_peg()
+        elif self.record_video:
+            self._run_passive_viewer(interactive=False)
         else:
             self._run_standard_viewer()
 
@@ -945,6 +1090,11 @@ def parse_args():
         action="store_true",
         help="Enable live force arrow overlay (peg_in_hole + --interactive only)",
     )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        help="Save run_recording.mp4 in results/<scenario>/ (uses passive viewer; mjpython on macOS)",
+    )
     return parser.parse_args()
 
 
@@ -954,5 +1104,6 @@ if __name__ == "__main__":
         scenario=args.scenario,
         interactive=args.interactive,
         force_feedback=args.force_feedback,
+        record_video=args.record_video,
     )
     env.run()
