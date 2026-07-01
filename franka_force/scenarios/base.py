@@ -38,6 +38,9 @@ class Scenario:
     def update_interactive_viewer(self, env, viewer):
         pass
 
+    def update_recording_scene(self, env, scene):
+        pass
+
 
 class TargetContactScenario(Scenario):
     def is_target_contact(self, env, contact, gripper_ids):

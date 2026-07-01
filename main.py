@@ -35,12 +35,17 @@ def parse_args():
         "--force-visual",
         choices=FORCE_VISUAL_MODES,
         default="arrow",
-        help="Force feedback visual to show when --force-feedback is enabled",
+        help="Force feedback visual to show when live or recorded feedback is enabled",
     )
     parser.add_argument(
         "--record-video",
         action="store_true",
         help="Save run_recording.mp4 in results/<scenario>/ (uses passive viewer; mjpython on macOS)",
+    )
+    parser.add_argument(
+        "--record-force-feedback",
+        action="store_true",
+        help="Include force feedback overlay geoms in --record-video output (peg_in_hole only)",
     )
     parser.add_argument(
         "--contact-cushion",
@@ -108,6 +113,7 @@ if __name__ == "__main__":
         force_feedback=args.force_feedback,
         force_visual=args.force_visual,
         record_video=args.record_video,
+        record_force_feedback=args.record_force_feedback,
         contact_cushion=args.contact_cushion,
         cushion_threshold=args.cushion_threshold,
         impedance_kp=args.impedance_kp,

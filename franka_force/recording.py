@@ -34,7 +34,7 @@ class VideoRecorder:
             macro_block_size=1,
         )
 
-    def capture(self, data, camera):
+    def capture(self, data, camera, overlay_callback=None):
         if self._writer is None:
             return
 
@@ -43,6 +43,8 @@ class VideoRecorder:
             return
 
         self.renderer.update_scene(data, camera=camera)
+        if overlay_callback is not None:
+            overlay_callback(self.renderer.scene)
         frame = self.renderer.render()
         self._writer.append_data(frame)
         self._saved_frames += 1

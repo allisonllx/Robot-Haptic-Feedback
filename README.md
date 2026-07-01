@@ -83,7 +83,10 @@ Record a video of a run:
 ```bash
 mjpython main.py --scenario push_block --record-video
 mjpython main.py --scenario peg_in_hole --interactive --record-video
+mjpython main.py --scenario peg_in_hole --interactive --record-video --record-force-feedback --force-visual both
 ```
+
+`--record-force-feedback` includes the same visual feedback geoms in the saved video: the green idle marker before contact, plus the selected red/orange arrow, ring, or both during contact.
 
 Show CLI options:
 

@@ -140,13 +140,16 @@ class PegInHoleScenario(Scenario):
         print("(red collision boxes, joint axes, etc.), not robot controls.")
         print("Hold arrow keys for smooth motion if pynput is installed.")
         print("Peg orientation is locked pointing down; use 6/7 to spin it.")
-        if env.force_feedback:
+        if env._force_feedback_overlay_enabled():
             print("Force feedback overlay: ON")
             print(f"  Visual mode: {env.force_visual}")
             print("  Green sphere above hand = waiting for contact.")
             print("  Red/orange arrow starts at the strongest contact and points along force-on-peg.")
             print("  Red/orange contact ring is centered on the strongest contact surface.")
-            print("  (Run with --force-feedback; HUD also shows force in newtons)")
+            if env.force_feedback:
+                print("  Live viewer overlay enabled.")
+            if env.record_force_feedback:
+                print("  Recording overlay enabled.")
         else:
             print("Force feedback overlay: OFF")
         if env.contact_cushion:
@@ -198,8 +201,11 @@ class PegInHoleScenario(Scenario):
         self._sync_target_marker(env)
 
     def update_interactive_viewer(self, env, viewer):
-        self._draw_force_feedback(env, viewer)
+        self._draw_force_feedback(env, viewer.user_scn, clear=True)
         self._update_peg_hud(env, viewer)
+
+    def update_recording_scene(self, env, scene):
+        self._draw_force_feedback(env, scene, clear=False)
 
     def _add_floor_compass(self, spec, origin):
         """World-frame N/E/S/W arrows on the floor (teleop uses world +X/+Y, not camera axes)."""
@@ -701,7 +707,7 @@ class PegInHoleScenario(Scenario):
             moving = np.any(env._move_cmd != 0) or env._roll_cmd != 0
             roll_deg = np.degrees(env.target_roll)
         force_line = ""
-        if env.force_feedback:
+        if env._force_feedback_overlay_enabled():
             f_display = env._force_feedback_magnitude()
             force_line = (
                 f"force {f_display:.1f} N"
@@ -737,37 +743,38 @@ class PegInHoleScenario(Scenario):
         mujoco.mjv_initGeom(geom, gtype, size, pos, mat, rgba)
         geom.category = mujoco.mjtCatBit.mjCAT_DECOR
 
-    def _draw_force_feedback(self, env, viewer):
-        if not env.force_feedback or viewer.user_scn is None:
+    def _draw_force_feedback(self, env, scene, clear):
+        if not env._force_feedback_overlay_enabled() or scene is None:
             return
 
         f_display = env._force_feedback_magnitude()
         hand_pos = env.data.xpos[env.hand_body_id].astype(np.float64)
         identity = np.eye(3, dtype=np.float64).reshape(9, 1)
 
-        viewer.user_scn.ngeom = 0
-        idx = 0
+        if clear:
+            scene.ngeom = 0
+        idx = scene.ngeom
 
         if f_display <= self.force_visual_threshold:
-            idx = self._draw_idle_marker(env, viewer, idx, hand_pos, identity)
+            idx = self._draw_idle_marker(env, scene, idx, hand_pos, identity)
 
         if f_display > self.force_visual_threshold:
             if env.force_visual in ("arrow", "both"):
-                idx = self._draw_force_arrow(env, viewer, idx, identity)
+                idx = self._draw_force_arrow(env, scene, idx, identity)
             if env.force_visual in ("ring", "both"):
-                idx = self._draw_contact_ring(env, viewer, idx, identity)
+                idx = self._draw_contact_ring(env, scene, idx, identity)
 
-        viewer.user_scn.ngeom = idx
+        scene.ngeom = idx
 
-    def _draw_idle_marker(self, env, viewer, idx, hand_pos, identity):
-        if not self._has_user_geom_slot(viewer, idx):
+    def _draw_idle_marker(self, env, scene, idx, hand_pos, identity):
+        if not self._has_scene_geom_slot(scene, idx):
             return idx
 
         base_pos = self._force_gauge_origin(hand_pos).reshape(3, 1)
         base_rgba = np.array([0.25, 0.85, 0.35, 0.9], dtype=np.float32).reshape(4, 1)
 
         self._set_user_geom(
-            viewer.user_scn.geoms[idx],
+            scene.geoms[idx],
             mujoco.mjtGeom.mjGEOM_SPHERE,
             np.array([0.020, 0.0, 0.0], dtype=np.float64).reshape(3, 1),
             base_pos,
@@ -776,8 +783,8 @@ class PegInHoleScenario(Scenario):
         )
         return idx + 1
 
-    def _draw_force_arrow(self, env, viewer, idx, identity):
-        if env.latest_contact_arrow_pos is None or not self._has_user_geom_slot(viewer, idx):
+    def _draw_force_arrow(self, env, scene, idx, identity):
+        if env.latest_contact_arrow_pos is None or not self._has_scene_geom_slot(scene, idx):
             return idx
 
         force_vector = np.asarray(env.latest_contact_arrow_vector, dtype=np.float64)
@@ -799,17 +806,17 @@ class PegInHoleScenario(Scenario):
         color = self._force_color(intensity)
         zero3 = np.zeros((3, 1), dtype=np.float64)
 
-        arrow_geom = viewer.user_scn.geoms[idx]
+        arrow_geom = scene.geoms[idx]
         self._set_user_geom(arrow_geom, mujoco.mjtGeom.mjGEOM_ARROW, zero3, zero3, identity, color)
         mujoco.mjv_connector(arrow_geom, mujoco.mjtGeom.mjGEOM_ARROW, shaft_width, p1, p2)
         return idx + 1
 
-    def _draw_contact_ring(self, env, viewer, idx, identity):
+    def _draw_contact_ring(self, env, scene, idx, identity):
         if env.latest_contact_pos is None or env.latest_contact_frame is None:
             return idx
 
         segments = 24
-        if not self._has_user_geom_slot(viewer, idx + segments - 1):
+        if not self._has_scene_geom_slot(scene, idx + segments - 1):
             return idx
 
         force_magnitude = max(env.latest_contact_force, self._force_feedback_magnitude(env))
@@ -834,7 +841,7 @@ class PegInHoleScenario(Scenario):
             theta2 = 2.0 * np.pi * (segment + 1) / segments
             p1 = center + radius * (np.cos(theta1) * tangent_a + np.sin(theta1) * tangent_b)
             p2 = center + radius * (np.cos(theta2) * tangent_a + np.sin(theta2) * tangent_b)
-            ring_geom = viewer.user_scn.geoms[idx]
+            ring_geom = scene.geoms[idx]
             self._set_user_geom(ring_geom, mujoco.mjtGeom.mjGEOM_CAPSULE, zero3, zero3, identity, color)
             mujoco.mjv_connector(ring_geom, mujoco.mjtGeom.mjGEOM_CAPSULE, ring_width, p1, p2)
             idx += 1
@@ -863,10 +870,10 @@ class PegInHoleScenario(Scenario):
             return fallback.astype(np.float64)
         return value / norm
 
-    def _has_user_geom_slot(self, viewer, idx):
-        maxgeom = getattr(viewer.user_scn, "maxgeom", None)
+    def _has_scene_geom_slot(self, scene, idx):
+        maxgeom = getattr(scene, "maxgeom", None)
         if maxgeom is None:
-            maxgeom = len(viewer.user_scn.geoms)
+            maxgeom = len(scene.geoms)
         return idx < maxgeom
 
     def _force_feedback_magnitude(self, env):

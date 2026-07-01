@@ -30,6 +30,7 @@ class FrankaForceEnv:
         force_feedback=False,
         force_visual="arrow",
         record_video=False,
+        record_force_feedback=False,
         contact_cushion=False,
         cushion_threshold=DEFAULT_CUSHION_THRESHOLD,
         impedance_kp=DEFAULT_IMPEDANCE_KP,
@@ -51,6 +52,7 @@ class FrankaForceEnv:
         self.force_feedback = force_feedback
         self.force_visual = force_visual
         self.record_video = record_video
+        self.record_force_feedback = record_force_feedback
         self.contact_cushion = contact_cushion
         self.cushion_threshold = cushion_threshold
         self.impedance_kp = impedance_kp
@@ -63,6 +65,10 @@ class FrankaForceEnv:
 
         if force_feedback and not interactive:
             raise ValueError("force_feedback requires interactive=True")
+        if record_force_feedback and not record_video:
+            raise ValueError("record_force_feedback requires record_video=True")
+        if record_force_feedback and scenario != "peg_in_hole":
+            raise ValueError("record_force_feedback is only supported for peg_in_hole")
         if interactive and not self.scenario_impl.supports_interactive:
             raise ValueError("interactive mode is only supported for peg_in_hole")
         if contact_cushion and (scenario != "peg_in_hole" or not interactive):
@@ -264,6 +270,9 @@ class FrankaForceEnv:
     def _force_feedback_magnitude(self):
         return max(self.latest_f_est, self.latest_f_true)
 
+    def _force_feedback_overlay_enabled(self):
+        return self.force_feedback or self.record_force_feedback
+
     def _apply_control_policy_callback(self, model, data):
         self._apply_control_policy()
 
@@ -302,7 +311,7 @@ class FrankaForceEnv:
                     for _ in range(substeps):
                         mujoco.mj_step(self.model, self.data)
 
-                    if interactive:
+                    if interactive or self.record_force_feedback:
                         self._update_live_force()
                     self._record_telemetry()
 
@@ -310,7 +319,12 @@ class FrankaForceEnv:
                         self.scenario_impl.update_interactive_viewer(self, viewer)
 
                     if recorder is not None:
-                        recorder.capture(self.data, viewer.cam)
+                        overlay_callback = None
+                        if self.record_force_feedback:
+                            overlay_callback = (
+                                lambda scene: self.scenario_impl.update_recording_scene(self, scene)
+                            )
+                        recorder.capture(self.data, viewer.cam, overlay_callback=overlay_callback)
 
                     viewer.sync()
         except RuntimeError as exc:
