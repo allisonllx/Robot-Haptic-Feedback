@@ -64,6 +64,10 @@ mjpython main.py --scenario peg_in_hole --interactive --force-feedback --force-v
 
 `arrow` draws a red/orange vector at the strongest peg contact point, pointing in the world-space force direction applied to the peg. `ring` draws a red/orange ring at the strongest contact surface, and `both` draws both overlays. The size of each overlay uses a log scale from roughly `10 N` to `1000 N`, so mid-range forces remain visually distinguishable without huge spikes dominating the view.
 
+In the simulator, these visual overlays are contact-data based rather than Jacobian-estimate based. MuJoCo provides the contact point, contact frame, and contact force, so the arrow/ring can show where the socket wall is pushing the peg. The Jacobian estimate is still logged and plotted for comparison, but by itself it gives an end-effector wrench estimate rather than a ground-truth contact point on the hole wall.
+
+For future physical robot runs, MuJoCo contact data will not be available. A real-system version should rely on the Jacobian/torque-based wrench estimate, force-torque sensing, or another contact-localization signal. Without tactile sensing, vision, proximity checks, or geometry-based inference, the real robot can show an estimated force vector at the end effector, but it cannot know the exact surface contact point in the same way the simulator can.
+
 Make the **peg and socket walls semi-transparent** when inspecting internal contacts:
 
 ```bash
